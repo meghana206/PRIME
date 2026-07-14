@@ -1,0 +1,358 @@
+// ================== INCLUDES ==================
+#include <Wire.h>
+#include <math.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <Preferences.h>
+#include <ArduinoJson.h>
+
+// Standard ESP32 BLE (Newer API compatible)
+#include <WiFiManager.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+// ================== CONFIG & PINS ==================
+#define MQTT_HOST "74dcb0592fa54c0aad9ac87e6add3335.s1.eu.hivemq.cloud"
+#define MQTT_PORT 8883
+#define MQTT_USER "prime_worker"
+#define MQTT_PASS "CzP_m3c8s#nHVbx"
+
+#define CURRENT_PIN   34
+#define VOLTAGE_PIN   35
+#define RELAY_PIN     26
+#define BUZZER_PIN    27
+#define LED_NORMAL    25
+#define LED_WARN      33
+#define LED_TRIP      32
+#define BTN_PAIR      19
+
+#define LONG_PRESS_TIME      3000  
+#define AUTO_TRIP_SUSTAIN_MS 20000 
+#define PUBLISH_INTERVAL_MS  500
+
+// ================== GLOBALS ==================
+Preferences prefs;
+WiFiClientSecure secureClient;
+PubSubClient mqttClient(secureClient);
+WiFiManager wm; 
+
+String deviceId;
+String cmdTopic; 
+
+enum AppState { STATE_PROVISIONING, STATE_RUNNING };
+AppState appState = STATE_PROVISIONING;
+
+unsigned long pressStartTime = 0;
+bool isPressing = false;
+bool longPressHandled = false;
+bool wifiCredReceived = false;
+String receivedSSID, receivedPass;
+
+BLECharacteristic* statusChar = nullptr;
+String bleBuffer = ""; // Global buffer for JSON chunking
+
+bool autoTripped = false;
+bool manualOff   = false;
+bool relayOn     = true; 
+bool overpowerActive = false;
+unsigned long overpowerStartMs = 0;
+
+float energy_kWh = 0.0;
+unsigned long lastUpdateMillis = 0;
+unsigned long lastPublishMillis = 0;
+
+// ================== HELPERS ==================
+
+void setRelay(bool on) {
+  relayOn = on;
+  digitalWrite(RELAY_PIN, on ? HIGH : LOW);
+}
+
+void alertBuzzer(int beeps = 3) {
+  for (int i = 0; i < beeps; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(300);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(200);
+  }
+}
+
+float computeRMS_Inverted(int pin, float maxVal) {
+  float sumSq = 0;
+  for (int i = 0; i < 200; i++) {
+    float v = 3.3 - (analogRead(pin) * (3.3 / 4095.0));
+    v -= 1.65; 
+    sumSq += v * v;
+    delayMicroseconds(200);
+  }
+  return sqrt(sumSq / 200) * (maxVal / 1.65);
+}
+
+// ================== BLE CALLBACKS ==================
+
+class ServerCallbacks: public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    Serial.println("📱 BLE Client Connected! Clearing old packet buffers...");
+    bleBuffer = ""; // Reset the buffer completely on a new physical connection
+  }
+  
+  void onDisconnect(BLEServer* pServer) {
+    BLEDevice::startAdvertising();
+    Serial.println("🔌 BLE Client Disconnected. Restarting Advertising...");
+    bleBuffer = "";
+  }
+};
+
+class WiFiCredCB : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* c) {
+    std::string value = c->getValue();
+    
+    // Safety dump of incoming raw packet
+    for(int i=0; i < value.length(); i++){
+      bleBuffer += value[i];
+    }
+
+    Serial.println("--- BLE CHUNK ---");
+    Serial.println("Pkt: " + String(value.c_str()));
+    
+    if (bleBuffer.indexOf("}") != -1) {
+      Serial.println("\n📦 ASSEMBLED BLE JSON: [" + bleBuffer + "]");
+      
+      StaticJsonDocument<256> doc;
+      DeserializationError error = deserializeJson(doc, bleBuffer);
+      
+      if (error == DeserializationError::Ok) {
+        receivedSSID = doc["ssid"].as<String>();
+        receivedPass = doc["password"].as<String>();
+        wifiCredReceived = true;
+        Serial.println("✅ WiFi Config Parsed!");
+      } else {
+        Serial.print("❌ JSON Error: ");
+        Serial.println(error.c_str());
+      }
+      bleBuffer = ""; // Wipe after evaluation
+    }
+  }
+};
+
+void startDualProvisioning() {
+  Serial.println("🚀 Starting Dual-Stack Provisioning (BLE + WiFiManager)...");
+  
+  // 1. WiFiManager Setup
+  wm.setConfigPortalBlocking(false);
+  wm.startConfigPortal("PRIME-Setup");
+
+  // 2. BLE Setup
+  BLEDevice::init("PRIME-Setup");
+  BLEServer* server = BLEDevice::createServer();
+  server->setCallbacks(new ServerCallbacks());
+  
+  BLEService* svc = server->createService("12345678-1234-1234-1234-123456789abc");
+
+  // Credentials Characteristic
+  BLECharacteristic* wifiChar = svc->createCharacteristic(
+                                    "12345678-1234-1234-1234-123456789001", 
+                                    BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR
+                                   );
+  wifiChar->setCallbacks(new WiFiCredCB());
+
+  // Device ID Characteristic
+  BLECharacteristic* idChar = svc->createCharacteristic(
+                                   "12345678-1234-1234-1234-123456789003", 
+                                   BLECharacteristic::PROPERTY_READ
+                                 );
+  idChar->setValue(deviceId.c_str());
+
+  // Status Characteristic
+  statusChar = svc->createCharacteristic(
+                                   "12345678-1234-1234-1234-123456789002", 
+                                   BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+                                 );
+  statusChar->setValue("IDLE");
+  statusChar->addDescriptor(new BLE2902());
+
+  svc->start();
+  BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(svc->getUUID());
+  pAdvertising->start();
+  
+  Serial.println("📡 Provisioning Active. Connect to 'PRIME-Setup' WiFi or BLE.");
+}
+
+// ================== MQTT & LOGIC ==================
+
+void onMQTTMessage(char* topic, byte* payload, unsigned int length) {
+  StaticJsonDocument<128> doc;
+  if (deserializeJson(doc, payload, length) != DeserializationError::Ok) return;
+  const char* cmd = doc["cmd"] | "";
+
+  if (strcmp(cmd, "trip") == 0) {
+    manualOff = true; setRelay(false);
+    Serial.println("🛑 Remote Trip");
+  } else if (strcmp(cmd, "restore") == 0) {
+    autoTripped = false; manualOff = false; overpowerActive = false;
+    setRelay(true);
+    Serial.println("🟢 Remote Restore");
+  }
+}
+
+bool connectMQTT() {
+  Serial.println("🌐 Connecting to MQTT: " + String(MQTT_HOST));
+  secureClient.setInsecure();
+  secureClient.setHandshakeTimeout(30); // CRITICAL: Stop mobile hotspot TLS timeouts
+  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+  mqttClient.setCallback(onMQTTMessage);
+  
+  if (mqttClient.connect(deviceId.c_str(), MQTT_USER, MQTT_PASS)) {
+    cmdTopic = "devices/" + deviceId + "/cmd";
+    mqttClient.subscribe(cmdTopic.c_str());
+    Serial.println("✅ MQTT Connected");
+    return true;
+  }
+  Serial.print("❌ MQTT Connect Failed! State=");
+  Serial.println(mqttClient.state());
+  return false;
+}
+
+void handleReset() {
+  prefs.begin("prime", false); prefs.clear(); prefs.end();
+  wm.resetSettings(); 
+  Serial.println("♻️ Factory Reset! Restarting...");
+  delay(1000);
+  ESP.restart();
+}
+
+// ================== SETUP & LOOP ==================
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(RELAY_PIN, OUTPUT); pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(LED_NORMAL, OUTPUT); pinMode(LED_WARN, OUTPUT);
+  pinMode(LED_TRIP, OUTPUT); pinMode(BTN_PAIR, INPUT_PULLUP);
+
+  setRelay(true);
+  
+  // Generate Unique ID straight from hardware fuse!
+  uint64_t chipid = ESP.getEfuseMac();
+  char idStr[18];
+  snprintf(idStr, sizeof(idStr), "%04X%08X", (uint16_t)(chipid >> 32), (uint32_t)chipid);
+  deviceId = String(idStr);
+
+  prefs.begin("prime", true);
+  String ssid = prefs.getString("ssid", "");
+  String pass = prefs.getString("pass", "");
+  prefs.end();
+
+  if (ssid.length() > 0) {
+    Serial.println("Trying saved WiFi: " + ssid);
+    // Disconnect cleanly before attempting to ensure no ghost connections 
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    delay(100);
+    WiFi.begin(ssid.c_str(), pass.c_str());
+    unsigned long startAttempt = millis();
+    // Allow generous 15s for mobile hotspots to assign DHCP internal IPs
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 15000) {
+      delay(500); Serial.print(".");
+    }
+
+    if (WiFi.status() == WL_CONNECTED && connectMQTT()) {
+      appState = STATE_RUNNING;
+      digitalWrite(LED_NORMAL, HIGH);
+      Serial.println("\n✅ Running Mode");
+    } else {
+      startDualProvisioning();
+    }
+  } else {
+    startDualProvisioning();
+  }
+  lastUpdateMillis = millis();
+}
+
+void loop() {
+  // 1. Factory Reset Button (Hold 3s)
+  if (digitalRead(BTN_PAIR) == LOW) {
+    if (!isPressing) { pressStartTime = millis(); isPressing = true; longPressHandled = false; }
+    if (!longPressHandled && (millis() - pressStartTime > LONG_PRESS_TIME)) { 
+      handleReset(); 
+      longPressHandled = true; 
+    }
+  } else { isPressing = false; }
+
+  // 2. Provisioning Mode Loop
+  if (appState == STATE_PROVISIONING) {
+    wm.process(); // Handle WiFi Portal
+
+    if (WiFi.status() == WL_CONNECTED || wifiCredReceived) {
+      String s = wifiCredReceived ? receivedSSID : WiFi.SSID();
+      String p = wifiCredReceived ? receivedPass : WiFi.psk();
+      
+      prefs.begin("prime", false); 
+      prefs.putString("ssid", s); 
+      prefs.putString("pass", p); 
+      prefs.end();
+      
+      if(statusChar) { statusChar->setValue("OK"); statusChar->notify(); }
+      
+      Serial.println("\nCredentials Saved. Rebooting...");
+      delay(1500);
+      ESP.restart();
+    }
+  }
+
+  // 3. Operational Mode Loop
+  if (appState == STATE_RUNNING) {
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("Wi-Fi Lost! Reconnecting...");
+      WiFi.reconnect();
+      delay(5000); // Give it breathe room to reconnect
+    } else if (!mqttClient.connected()) {
+      static unsigned long lastReconnectAttempt = 0;
+      if (millis() - lastReconnectAttempt > 5000) {
+        lastReconnectAttempt = millis();
+        connectMQTT();
+      }
+    } else {
+      mqttClient.loop();
+    }
+    mqttClient.loop();
+
+    float V = computeRMS_Inverted(VOLTAGE_PIN, 300);
+    float I = computeRMS_Inverted(CURRENT_PIN, 30);
+    float P = V * I;
+
+    // Protection Logic
+    if (!autoTripped && !manualOff) {
+      if (P > 2000) { // 2kW Limit
+        if (!overpowerActive) { overpowerActive = true; overpowerStartMs = millis(); digitalWrite(LED_WARN, HIGH); }
+        else if (millis() - overpowerStartMs >= AUTO_TRIP_SUSTAIN_MS) {
+          autoTripped = true; setRelay(false); alertBuzzer(5);
+        }
+      } else { overpowerActive = false; digitalWrite(LED_WARN, LOW); }
+    }
+
+    digitalWrite(LED_TRIP, (autoTripped || manualOff) ? HIGH : LOW);
+    digitalWrite(LED_NORMAL, (autoTripped || manualOff) ? LOW : HIGH);
+
+    // Telemetry Publishing
+    if (millis() - lastPublishMillis > PUBLISH_INTERVAL_MS) {
+      float intervalHours = (millis() - lastUpdateMillis) / 3600000.0;
+      if (relayOn) energy_kWh += P * intervalHours;
+      lastUpdateMillis = millis();
+
+      StaticJsonDocument<256> outDoc;
+      outDoc["deviceId"] = deviceId;
+      outDoc["power"] = relayOn ? P : 0;
+      outDoc["tripped"] = (autoTripped || manualOff);
+      outDoc["energy"] = energy_kWh;
+      
+      char buf[256];
+      serializeJson(outDoc, buf);
+      mqttClient.publish(("devices/" + deviceId + "/data").c_str(), buf);
+      lastPublishMillis = millis();
+    }
+  }
+}
